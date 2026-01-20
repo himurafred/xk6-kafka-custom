@@ -278,6 +278,7 @@ export interface Container {
   data: any;
   schema: Schema;
   schemaType: SCHEMA_TYPES;
+  avroEncoding?: string; // "json" for JSON Avro, omit for binary Avro
 }
 
 export interface JKSConfig {

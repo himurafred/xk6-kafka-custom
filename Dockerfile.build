@@ -1,0 +1,43 @@
+# Multi-stage Dockerfile to build xk6-kafka with custom modifications
+# Stage 1: Build xk6-kafka binary with Go
+FROM golang:1.25-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates
+
+# Set working directory
+WORKDIR /build
+
+# Copy go module files first for better layer caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the entire source code
+COPY . .
+
+# Build xk6-kafka using xk6
+# Install xk6 first
+RUN go install go.k6.io/xk6/cmd/xk6@latest
+
+# Build k6 with the local xk6-kafka module
+RUN xk6 build \
+    --with github.com/mostafa/xk6-kafka=. \
+    --output /tmp/k6
+
+# Stage 2: Create minimal runtime image
+FROM alpine:3.23
+
+# Install runtime dependencies
+RUN apk add --no-cache ca-certificates openssl && \
+    adduser -D -u 12345 -g 12345 k6
+
+# Copy the built k6 binary from builder stage
+COPY --from=builder /tmp/k6 /usr/bin/k6
+
+# Switch to non-root user
+USER 12345
+WORKDIR /home/k6
+
+# Set k6 as entrypoint
+ENTRYPOINT ["k6"]
+CMD ["version"]

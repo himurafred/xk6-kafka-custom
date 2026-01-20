@@ -22,13 +22,14 @@ const (
 	invalidDataType            errCode = 2000
 	failedToEncode             errCode = 2001
 	failedToEncodeToBinary     errCode = 2002
-	failedToDecodeFromBinary   errCode = 2003
-	failedUnmarshalJSON        errCode = 2004
-	failedValidateJSON         errCode = 2005
-	failedDecodeJSONFromBinary errCode = 2006
-	failedUnmarshalSchema      errCode = 2007
-	invalidSerdeType           errCode = 2008
-	failedDecodeBase64         errCode = 2009
+	failedToEncodeToJSON       errCode = 2003
+	failedToDecodeFromBinary   errCode = 2004
+	failedUnmarshalJSON        errCode = 2005
+	failedValidateJSON         errCode = 2006
+	failedDecodeJSONFromBinary errCode = 2007
+	failedUnmarshalSchema      errCode = 2008
+	invalidSerdeType           errCode = 2009
+	failedDecodeBase64         errCode = 2010
 
 	// consumer.
 	failedSetOffset        errCode = 3000

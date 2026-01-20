@@ -1,14 +1,20 @@
 package kafka
 
 import (
+	"fmt"
+
 	"github.com/riferrei/srclient"
+	"github.com/sirupsen/logrus"
 	"go.k6.io/k6/js/common"
 )
 
 type Container struct {
-	Data       any                 `json:"data"`
-	Schema     *Schema             `json:"schema"`
-	SchemaType srclient.SchemaType `json:"schemaType"`
+	Data              any                 `json:"data"`
+	Schema            *Schema             `json:"schema"`
+	SchemaType        srclient.SchemaType `json:"schemaType"`
+	AvroEncoding      string              `json:"avroEncoding"`
+	SchemaRegistryURL string              `json:"schemaRegistryURL"`
+	Headers           map[string]any      `json:"headers"`
 }
 
 // serialize checks whether the incoming data has a schema or not.
@@ -18,6 +24,39 @@ type Container struct {
 // a JSONSchema. Then, it returns the data as a byte array.
 // nolint: funlen
 func (k *Kafka) serialize(container *Container) []byte {
+	// Auto-fetch schema from registry if schema is incomplete but we have registry URL and subject
+	if container.Schema != nil && container.Schema.Schema == "" && container.Schema.Subject != "" && container.SchemaRegistryURL != "" {
+		logrus.WithFields(logrus.Fields{
+			"subject": container.Schema.Subject,
+			"version": container.Schema.Version,
+		}).Info("🔍 Auto-fetching schema from registry for serialization")
+
+		// Create a schema registry client if not already created
+		if k.currentSchemaRegistry == nil {
+			config := &SchemaRegistryConfig{
+				URL:           container.SchemaRegistryURL,
+				EnableCaching: true,
+			}
+			client := k.schemaRegistryClient(config)
+			k.currentSchemaRegistry = client
+		}
+
+		// Fetch the schema
+		fetchedSchema := k.getSchema(k.currentSchemaRegistry, container.Schema)
+		if fetchedSchema != nil {
+			container.Schema = fetchedSchema
+			logrus.WithFields(logrus.Fields{
+				"subject":  container.Schema.Subject,
+				"schemaID": container.Schema.ID,
+				"version":  container.Schema.Version,
+			}).Info("✅ Schema fetched successfully")
+		} else {
+			err := fmt.Errorf("failed to fetch schema for subject: %s", container.Schema.Subject)
+			common.Throw(k.vu.Runtime(), err)
+			return nil
+		}
+	}
+
 	if container.Schema == nil {
 		// we are dealing with a byte array, a string or a JSON object without a JSONSchema
 		serde, err := GetSerdes(container.SchemaType)
@@ -57,6 +96,47 @@ func (k *Kafka) serialize(container *Container) []byte {
 
 	switch container.SchemaType {
 	case srclient.Avro, srclient.Json:
+		// DEBUG: Log encoding detection
+		logrus.WithFields(logrus.Fields{
+			"schemaType":   container.SchemaType,
+			"avroEncoding": container.AvroEncoding,
+			"isAvro":       container.SchemaType == srclient.Avro,
+			"isJSON":       container.AvroEncoding == "json",
+		}).Warn("🔍 DEBUG: Checking encoding type")
+		
+		// For JSON Avro encoding, use hamba/avro to encode to JSON Avro format
+		// This produces proper JSON Avro with union types wrapped correctly
+		if container.SchemaType == srclient.Avro && container.AvroEncoding == "json" {
+			// Use the AvroSerde to encode to JSON Avro
+			serde, err := GetSerdes(container.SchemaType)
+			if err != nil {
+				common.Throw(k.vu.Runtime(), err)
+				return nil
+			}
+			
+			avroSerde, ok := serde.(*AvroSerde)
+			if !ok {
+				common.Throw(k.vu.Runtime(), fmt.Errorf("failed to get AvroSerde"))
+				return nil
+			}
+			
+			// Serialize using SerializeJSONAvro which produces JSON Avro format
+			jsonAvroBytes, serdeErr := avroSerde.SerializeJSONAvro(container.Data, container.Schema)
+			if serdeErr != nil {
+				common.Throw(k.vu.Runtime(), serdeErr)
+				return nil
+			}
+
+			logrus.WithFields(logrus.Fields{
+				"schemaID":   container.Schema.ID,
+				"dataLength": len(jsonAvroBytes),
+			}).Info("✅ Serialized to JSON Avro (no wire format, will use Apicurio headers)")
+
+			// Return JSON Avro directly without wire format - the schema ID will be in Kafka headers
+			return jsonAvroBytes
+		}
+
+		// For binary Avro encoding, use the serde (hamba/avro)
 		serde, err := GetSerdes(container.SchemaType)
 		if err != nil {
 			common.Throw(k.vu.Runtime(), err)
@@ -69,6 +149,7 @@ func (k *Kafka) serialize(container *Container) []byte {
 			return nil
 		}
 
+		// Add wire format for binary Avro
 		return k.encodeWireFormat(bytesData, container.Schema.ID)
 	case srclient.Protobuf:
 		common.Throw(k.vu.Runtime(), ErrUnsupportedOperation)

@@ -77,6 +77,7 @@ type (
 		exports               *sobek.Object
 		schemaCache           map[string]*Schema
 		currentSchemaRegistry *srclient.SchemaRegistryClient
+		schemaRegistryConfig  *SchemaRegistryConfig  // Store config to check Apicurio mode
 	}
 	RootModule struct{}
 	Module     struct {

@@ -8,6 +8,13 @@ import (
 	"github.com/hamba/avro/v2"
 )
 
+// IMPORTANT:
+// This file handles BINARY Avro encoding/decoding ONLY.
+// Binary Avro requires strict typing (float64→int32/int64 conversion, union wrapping for named types).
+// DO NOT use this code for JSON Avro serialization - see avro_json.go instead.
+// Avro Binary and Avro JSON are two distinct encodings with different rules.
+// NEVER share conversion logic between them.
+
 var (
 	// ErrCannotConvertToByte is returned when a value cannot be converted to byte.
 	ErrCannotConvertToByte = errors.New("cannot convert value to byte")
@@ -75,6 +82,7 @@ func convertPrimitiveType(data any, schema avro.Schema) (any, error) {
 }
 
 // convertUnionField converts a union field value, wrapping named schemas appropriately.
+// Binary Avro requires strict union branch selection - the writer MUST provide the correct branch.
 func convertUnionField(fieldValue any, unionSchema *avro.UnionSchema) (any, error) {
 	if fieldValue == nil {
 		//nolint: nilnil // nil is a valid union value
@@ -83,9 +91,8 @@ func convertUnionField(fieldValue any, unionSchema *avro.UnionSchema) (any, erro
 
 	types := unionSchema.Types()
 
-	// Handle map values (could be wrapped union or record)
+	// Check if already wrapped: {"typeName": value}
 	if fieldValueMap, ok := fieldValue.(map[string]any); ok {
-		// Check if it's already wrapped: {"typeName": value}
 		if len(fieldValueMap) == 1 {
 			for key, wrappedValue := range fieldValueMap {
 				// Try to find matching named schema
@@ -108,29 +115,10 @@ func convertUnionField(fieldValue any, unionSchema *avro.UnionSchema) (any, erro
 				}
 			}
 		}
-
-		// Not wrapped, try to match as record
-		for _, unionType := range types {
-			if unionType.Type() == avro.Null {
-				continue
-			}
-			actualType := unionType
-			if refSchema, ok := unionType.(*avro.RefSchema); ok {
-				actualType = refSchema.Schema()
-			}
-			if actualType.Type() == avro.Record {
-				converted, err := convertFloat64ToIntForIntegerFields(fieldValueMap, actualType)
-				if err == nil {
-					if namedSchema, ok := actualType.(avro.NamedSchema); ok {
-						return map[string]any{namedSchema.FullName(): converted}, nil
-					}
-					return converted, nil
-				}
-			}
-		}
 	}
 
-	// Handle non-map values (primitives, enums)
+	// Not wrapped - try each branch strictly
+	var matches []any
 	for _, unionType := range types {
 		if unionType.Type() == avro.Null {
 			continue
@@ -140,28 +128,25 @@ func convertUnionField(fieldValue any, unionSchema *avro.UnionSchema) (any, erro
 			actualType = refSchema.Schema()
 		}
 
-		// Named schemas (enums, fixed) need wrapping
-		if namedSchema, ok := actualType.(avro.NamedSchema); ok {
-			if actualType.Type() == avro.Enum {
-				// Enums are strings, wrap directly
-				return map[string]any{namedSchema.FullName(): fieldValue}, nil
-			}
-			// Other named types, try converting first
-			converted, err := convertFloat64ToIntForIntegerFields(fieldValue, actualType)
-			if err == nil {
-				return map[string]any{namedSchema.FullName(): converted}, nil
-			}
-		} else {
-			// Primitive types, convert and return directly
-			converted, err := convertFloat64ToIntForIntegerFields(fieldValue, actualType)
-			if err == nil {
-				return converted, nil
+		converted, err := convertFloat64ToIntForIntegerFields(fieldValue, actualType)
+		if err == nil {
+			// Named schemas need wrapping
+			if namedSchema, ok := actualType.(avro.NamedSchema); ok {
+				matches = append(matches, map[string]any{namedSchema.FullName(): converted})
+			} else {
+				matches = append(matches, converted)
 			}
 		}
 	}
 
-	// Couldn't match, return as-is
-	return fieldValue, nil
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("value does not match any union branch")
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("value matches multiple union branches (ambiguous)")
+	}
+
+	return matches[0], nil
 }
 
 // convertFloat64ToIntForIntegerFields converts float64 values to int32/int64 for int/long schema fields.
@@ -267,13 +252,7 @@ func convertRecordFields(data any, schema avro.Schema, convertField func(any, av
 		resultMap[fieldName] = convertedValue
 	}
 
-	// Copy any remaining fields that aren't in the schema
-	for k, v := range dataMap {
-		if _, exists := resultMap[k]; !exists {
-			resultMap[k] = v
-		}
-	}
-
+	// Binary Avro: schema is authoritative, ignore fields not in schema
 	return resultMap, nil
 }
 

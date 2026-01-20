@@ -36,6 +36,7 @@ type SchemaRegistryConfig struct {
 	URL           string    `json:"url"`
 	BasicAuth     BasicAuth `json:"basicAuth"`
 	TLS           TLSConfig `json:"tls"`
+	Apicurio      bool      `json:"apicurio"` // Use Apicurio API instead of Confluent
 }
 
 const (
@@ -398,8 +399,9 @@ func (k *Kafka) schemaRegistryClientClass(call sobek.ConstructorCall) *sobek.Obj
 
 		schemaRegistryClient = k.schemaRegistryClient(configuration)
 
-		// Store the client in Kafka struct so we can use it to create resolvers later
+		// Store the client and config in Kafka struct so we can use it to create resolvers later
 		k.currentSchemaRegistry = schemaRegistryClient
+		k.schemaRegistryConfig = configuration
 	}
 
 	schemaRegistryClientObject := runtime.NewObject()
@@ -498,7 +500,18 @@ func (k *Kafka) schemaRegistryClientClass(call sobek.ConstructorCall) *sobek.Obj
 			}
 		}
 
-		return runtime.ToValue(k.serialize(metadata))
+		serializedBytes := k.serialize(metadata)
+		
+		// DEBUG: Log the final serialized bytes being returned to JavaScript
+		if len(serializedBytes) >= 5 {
+			logrus.WithFields(logrus.Fields{
+				"wireFormatPrefix": serializedBytes[:5],
+				"totalLength":      len(serializedBytes),
+				"schemaIDFromBytes": binary.BigEndian.Uint32(serializedBytes[1:5]),
+			}).Warn("🚀 serialize: FINAL bytes being returned to JavaScript")
+		}
+		
+		return runtime.ToValue(serializedBytes)
 	})
 	if err != nil {
 		common.Throw(runtime, err)
@@ -629,6 +642,14 @@ func (k *Kafka) getSchema(client *srclient.SchemaRegistryClient, schema *Schema)
 	}
 
 	runtime := k.vu.Runtime()
+
+	// Check if Apicurio mode is enabled
+	if k.schemaRegistryConfig != nil && k.schemaRegistryConfig.Apicurio {
+		// Apicurio API v2 mode
+		return k.getSchemaApicurio(client, schema)
+	}
+
+	// Confluent Schema Registry mode (default)
 	// The client always caches the schema.
 	var schemaInfo *srclient.Schema
 	var err error
@@ -661,6 +682,139 @@ func (k *Kafka) getSchema(client *srclient.SchemaRegistryClient, schema *Schema)
 		common.Throw(runtime, err)
 		return nil
 	}
+}
+
+// getSchemaApicurio fetches schema from Apicurio Schema Registry v2 API
+// Apicurio API structure: /groups/{groupId}/artifacts/{artifactId}[/versions/{version}]
+func (k *Kafka) getSchemaApicurio(client *srclient.SchemaRegistryClient, schema *Schema) *Schema {
+	runtime := k.vu.Runtime()
+
+	// For Apicurio: subject is the topic name directly (no -value/-key suffix)
+	// We use "orbis.topic" as default groupId
+	groupId := "orbis.topic"
+	artifactId := schema.Subject
+
+	// Build Apicurio API URLs
+	baseURL := k.schemaRegistryConfig.URL
+	var schemaURL, metaURL string
+	
+	if schema.Version == 0 {
+		// Latest version
+		schemaURL = fmt.Sprintf("%s/groups/%s/artifacts/%s", baseURL, groupId, artifactId)
+		metaURL = fmt.Sprintf("%s/groups/%s/artifacts/%s/meta", baseURL, groupId, artifactId)
+	} else {
+		// Specific version
+		schemaURL = fmt.Sprintf("%s/groups/%s/artifacts/%s/versions/%d", baseURL, groupId, artifactId, schema.Version)
+		metaURL = fmt.Sprintf("%s/groups/%s/artifacts/%s/versions/%d/meta", baseURL, groupId, artifactId, schema.Version)
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"subject":   schema.Subject,
+		"artifactId": artifactId,
+		"groupId":   groupId,
+		"version":   schema.Version,
+		"schemaURL": schemaURL,
+		"metaURL":   metaURL,
+	}).Info("📥 Fetching schema from Apicurio Schema Registry")
+
+	// Fetch schema content
+	schemaResp, err := http.Get(schemaURL)
+	if err != nil {
+		err := NewXk6KafkaError(schemaNotFound, fmt.Sprintf("Failed to fetch schema from Apicurio: %s", schemaURL), err)
+		common.Throw(runtime, err)
+		return nil
+	}
+	defer schemaResp.Body.Close()
+
+	if schemaResp.StatusCode != 200 {
+		bodyBytes, _ := io.ReadAll(schemaResp.Body)
+		err := NewXk6KafkaError(schemaNotFound, 
+			fmt.Sprintf("Apicurio returned HTTP %d for schema: %s", schemaResp.StatusCode, string(bodyBytes)), nil)
+		common.Throw(runtime, err)
+		return nil
+	}
+
+	schemaBytes, err := io.ReadAll(schemaResp.Body)
+	if err != nil {
+		err := NewXk6KafkaError(schemaNotFound, "Failed to read schema response body", err)
+		common.Throw(runtime, err)
+		return nil
+	}
+
+	// Fetch metadata (globalId, version, etc.)
+	metaResp, err := http.Get(metaURL)
+	if err != nil {
+		err := NewXk6KafkaError(schemaNotFound, fmt.Sprintf("Failed to fetch metadata from Apicurio: %s", metaURL), err)
+		common.Throw(runtime, err)
+		return nil
+	}
+	defer metaResp.Body.Close()
+
+	if metaResp.StatusCode != 200 {
+		bodyBytes, _ := io.ReadAll(metaResp.Body)
+		err := NewXk6KafkaError(schemaNotFound, 
+			fmt.Sprintf("Apicurio returned HTTP %d for metadata: %s", metaResp.StatusCode, string(bodyBytes)), nil)
+		common.Throw(runtime, err)
+		return nil
+	}
+
+	metaBytes, err := io.ReadAll(metaResp.Body)
+	if err != nil {
+		err := NewXk6KafkaError(schemaNotFound, "Failed to read metadata response body", err)
+		common.Throw(runtime, err)
+		return nil
+	}
+
+	// Parse metadata to extract globalId and version
+	var metadata struct {
+		GlobalId int    `json:"globalId"`
+		Version  string `json:"version"`
+		Type     string `json:"type"`
+	}
+	
+	if err := json.Unmarshal(metaBytes, &metadata); err != nil {
+		err := NewXk6KafkaError(schemaNotFound, "Failed to parse Apicurio metadata JSON", err)
+		common.Throw(runtime, err)
+		return nil
+	}
+
+	// Parse version string to int
+	var versionInt int
+	fmt.Sscanf(metadata.Version, "%d", &versionInt)
+
+	// Determine schema type
+	schemaType := srclient.Avro
+	if metadata.Type == "JSON" {
+		schemaType = srclient.Json
+	} else if metadata.Type == "PROTOBUF" {
+		schemaType = srclient.Protobuf
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"subject":  schema.Subject,
+		"globalId": metadata.GlobalId,
+		"version":  versionInt,
+		"type":     metadata.Type,
+	}).Info("✅ Schema fetched successfully from Apicurio")
+
+	// Create wrapped schema
+	wrappedSchema := &Schema{
+		EnableCaching: schema.EnableCaching,
+		ID:            metadata.GlobalId,
+		Version:       versionInt,
+		Schema:        string(schemaBytes),
+		SchemaType:    &schemaType,
+		References:    []srclient.Reference{},
+		Subject:       schema.Subject,
+		resolver:      k.createResolver(client, schema.EnableCaching),
+	}
+
+	// Cache the schema if caching is enabled
+	if wrappedSchema.EnableCaching {
+		k.schemaCache[wrappedSchema.Subject] = wrappedSchema
+	}
+
+	return wrappedSchema
 }
 
 // createSchema creates a new schema in the schema registry.
@@ -742,13 +896,24 @@ func (k *Kafka) getSubjectName(subjectNameConfig *SubjectNameConfig) string {
 // JSONSchema payload.
 // https://docs.confluent.io/platform/current/schema-registry/serdes-develop/index.html#wire-format
 func (k *Kafka) encodeWireFormat(data []byte, schemaID int) []byte {
+	// DEBUG: Log the schemaID being encoded in wire format
+	logrus.WithField("schemaID", schemaID).Info("🔧 encodeWireFormat: encoding with schemaID")
+	
 	schemaIDBytes := make([]byte, MagicPrefixSize-1)
 	// Validate schemaID is within uint32 range to prevent overflow
 	if schemaID < 0 || schemaID > int(^uint32(0)) {
 		panic(fmt.Sprintf("schemaID %d is out of uint32 range [0, %d]", schemaID, ^uint32(0)))
 	}
 	binary.BigEndian.PutUint32(schemaIDBytes, uint32(schemaID))
-	return append(append([]byte{0}, schemaIDBytes...), data...)
+	result := append(append([]byte{0}, schemaIDBytes...), data...)
+	
+	// DEBUG: Log the actual bytes in the wire format prefix
+	logrus.WithFields(logrus.Fields{
+		"wireFormatPrefix": result[:5],
+		"schemaIDBytes":    schemaIDBytes,
+	}).Info("🔧 encodeWireFormat: wire format bytes")
+	
+	return result
 }
 
 // decodeWireFormat removes the proprietary 5-byte prefix from the Avro, ProtoBuf

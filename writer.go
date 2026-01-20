@@ -2,15 +2,18 @@ package kafka
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/grafana/sobek"
 	kafkago "github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/compress"
+	"github.com/sirupsen/logrus"
 	"go.k6.io/k6/js/common"
 	"go.k6.io/k6/metrics"
 )
@@ -103,6 +106,8 @@ type Message struct {
 	Key           []byte         `json:"key"`
 	Value         []byte         `json:"value"`
 	Headers       map[string]any `json:"headers"`
+	GlobalId      int            `json:"globalId,omitempty"`   // Optional: Apicurio globalId for JSON Avro
+	ArtifactId    string         `json:"artifactId,omitempty"` // Optional: Apicurio artifactId (topic name)
 
 	// If not set at the creation, Time will be automatically set when
 	// writing the message.
@@ -227,6 +232,60 @@ func (k *Kafka) writer(writerConfig *WriterConfig) *kafkago.Writer {
 	return writer
 }
 
+// simplifyAvroJSON converts goavro's verbose JSON format to Apicurio's simple JSON format
+// Example: {"long.timestamp-millis": 1234567890} => 1234567890
+func simplifyAvroJSON(verboseJSON []byte) ([]byte, error) {
+	var data interface{}
+	if err := json.Unmarshal(verboseJSON, &data); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	}
+	
+	simplified := simplifyValue(data)
+	
+	simpleJSON, err := json.Marshal(simplified)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal simplified JSON: %w", err)
+	}
+	
+	return simpleJSON, nil
+}
+
+// simplifyValue recursively simplifies a value
+func simplifyValue(val interface{}) interface{} {
+	switch v := val.(type) {
+	case map[string]interface{}:
+		// Check if it's a single-key object
+		if len(v) == 1 {
+			for key, value := range v {
+				// ONLY simplify logical types (keys with dot notation like "long.timestamp-millis")
+				// Do NOT touch union types (keys without dots like "string", "additionalInfo")
+				if strings.Contains(key, ".") {
+					// This is a logical type annotation - unwrap it
+					return simplifyValue(value)
+				}
+			}
+		}
+		// Regular object or union - recursively simplify all values but keep structure
+		result := make(map[string]interface{})
+		for key, value := range v {
+			result[key] = simplifyValue(value)
+		}
+		return result
+	case []interface{}:
+		// Array - recursively simplify all elements
+		result := make([]interface{}, len(v))
+		for i, elem := range v {
+			result[i] = simplifyValue(elem)
+		}
+		return result
+	default:
+		// Primitive value - return as is
+		return v
+	}
+}
+
+
+
 // produce sends messages to Kafka with the given configuration.
 // nolint: funlen
 func (k *Kafka) produce(writer *kafkago.Writer, produceConfig *ProduceConfig) {
@@ -263,14 +322,121 @@ func (k *Kafka) produce(writer *kafkago.Writer, produceConfig *ProduceConfig) {
 		// If a key was provided, add it to the message. Keys are optional.
 		if message.Key != nil {
 			kafkaMessages[index].Key = message.Key
+			
+			// Check if the key contains Apicurio wire format (magic byte 0x00 + 4 bytes schemaID)
+			// If yes, automatically add the Apicurio header with the globalId
+			// KEEP the wire format in the body for compatibility
+			if len(message.Key) >= 5 && message.Key[0] == 0x00 {
+				globalId := binary.BigEndian.Uint32(message.Key[1:5])
+				
+				// Add Apicurio header for key
+				globalIdBytes := make([]byte, 8)
+				binary.BigEndian.PutUint64(globalIdBytes, uint64(globalId))
+				
+				kafkaMessages[index].Headers = append(kafkaMessages[index].Headers, kafkago.Header{
+					Key:   "apicurio.key.globalId",
+					Value: globalIdBytes,
+				})
+				
+				logrus.WithFields(logrus.Fields{
+					"messageIndex": index,
+					"globalId":     globalId,
+					"topic":        kafkaMessages[index].Topic,
+				}).Info("✅ Added Apicurio header for key (keeping wire format in body)")
+			}
 		}
 
 		// Then add the value to the message.
 		if message.Value != nil {
 			kafkaMessages[index].Value = message.Value
+			
+			// Check if the value contains Apicurio wire format (magic byte 0x00 + 4 bytes schemaID)
+			// If yes, automatically add the Apicurio header with the globalId
+			if len(message.Value) >= 5 && message.Value[0] == 0x00 {
+				globalId := binary.BigEndian.Uint32(message.Value[1:5])
+				
+				// Add Apicurio header for value
+				globalIdBytes := make([]byte, 8)
+				binary.BigEndian.PutUint64(globalIdBytes, uint64(globalId))
+				
+				kafkaMessages[index].Headers = append(kafkaMessages[index].Headers, kafkago.Header{
+					Key:   "apicurio.value.globalId",
+					Value: globalIdBytes,
+				})
+				
+				// Add artifactId header - use provided artifactId or fall back to topic name
+				artifactId := message.ArtifactId
+				if artifactId == "" {
+					// Default to topic name if artifactId not explicitly provided
+					artifactId = kafkaMessages[index].Topic
+				}
+				
+				kafkaMessages[index].Headers = append(kafkaMessages[index].Headers, kafkago.Header{
+					Key:   "apicurio.value.artifactId",
+					Value: []byte(artifactId),
+				})
+				
+				// Strip the 5-byte wire format prefix for Apicurio (expects pure JSON body + headers)
+				kafkaMessages[index].Value = message.Value[5:]
+				
+				logrus.WithFields(logrus.Fields{
+					"messageIndex": index,
+					"globalId":     globalId,
+					"artifactId":   artifactId,
+					"topic":        kafkaMessages[index].Topic,
+					"originalSize": len(message.Value),
+					"strippedSize": len(kafkaMessages[index].Value),
+				}).Info("✅ Added Apicurio headers (globalId + artifactId) and stripped wire format")
+			} else if message.GlobalId != 0 {
+				// No wire format, but globalId provided = JSON Avro encoding
+				// For Apicurio: Send JSON payload WITHOUT wire format prefix + add headers
+				// Required headers: apicurio.value.globalId AND apicurio.value.artifactId
+				globalIdBytes := make([]byte, 8)
+				binary.BigEndian.PutUint64(globalIdBytes, uint64(message.GlobalId))
+				
+				kafkaMessages[index].Headers = append(kafkaMessages[index].Headers, kafkago.Header{
+					Key:   "apicurio.value.globalId",
+					Value: globalIdBytes,
+				})
+				
+				// Add artifactId header - use provided artifactId or fall back to topic name
+				artifactId := message.ArtifactId
+				if artifactId == "" {
+					// Default to topic name if artifactId not explicitly provided
+					artifactId = kafkaMessages[index].Topic
+				}
+				
+				kafkaMessages[index].Headers = append(kafkaMessages[index].Headers, kafkago.Header{
+					Key:   "apicurio.value.artifactId",
+					Value: []byte(artifactId),
+				})
+				
+				// If the value starts with wire format (0x00), strip it to keep only JSON
+				if len(message.Value) >= 5 && message.Value[0] == 0x00 {
+					// Strip the 5-byte wire format prefix (0x00 + 4 bytes schemaID)
+					kafkaMessages[index].Value = message.Value[5:]
+					logrus.WithFields(logrus.Fields{
+						"messageIndex":    index,
+						"globalId":        message.GlobalId,
+						"artifactId":      artifactId,
+						"topic":           kafkaMessages[index].Topic,
+						"originalSize":    len(message.Value),
+						"strippedSize":    len(kafkaMessages[index].Value),
+					}).Info("✅ Stripped wire format and added Apicurio headers (globalId + artifactId)")
+				} else {
+					// Already pure JSON without wire format
+					logrus.WithFields(logrus.Fields{
+						"messageIndex": index,
+						"globalId":     message.GlobalId,
+						"artifactId":   artifactId,
+						"topic":        kafkaMessages[index].Topic,
+						"valueSize":    len(message.Value),
+					}).Info("✅ Added Apicurio headers (globalId + artifactId) for JSON Avro")
+				}
+			}
 		}
 
-		// If headers are provided, add them to the message.
+		// If headers are provided, add them to the message (after Apicurio headers)
 		if len(message.Headers) > 0 {
 			for key, value := range message.Headers {
 				var headerValue []byte
@@ -281,6 +447,43 @@ func (k *Kafka) produce(writer *kafkago.Writer, produceConfig *ProduceConfig) {
 				})
 			}
 		}
+	}
+
+	// DEBUG: Log ALL messages just before sending to Kafka
+	for idx, kafkaMsg := range kafkaMessages {
+		logFields := logrus.Fields{
+			"messageIndex": idx,
+			"topic":        kafkaMsg.Topic,
+			"valueLength":  len(kafkaMsg.Value),
+			"headerCount":  len(kafkaMsg.Headers),
+		}
+		
+		// Log all headers
+		for _, h := range kafkaMsg.Headers {
+			if h.Key == "apicurio.value.globalId" {
+				if len(h.Value) == 8 {
+					globalIdFromHeader := binary.BigEndian.Uint64(h.Value)
+					logFields["apicurio.globalId"] = globalIdFromHeader
+				} else {
+					logFields["apicurio.globalId.bytes"] = h.Value
+				}
+			}
+			if h.Key == "apicurio.value.artifactId" {
+				logFields["apicurio.artifactId"] = string(h.Value)
+			}
+		}
+		
+		if len(kafkaMsg.Value) >= 5 {
+			if kafkaMsg.Value[0] == 0x00 {
+				schemaIDBeforeSend := binary.BigEndian.Uint32(kafkaMsg.Value[1:5])
+				logFields["wireFormatPrefix"] = kafkaMsg.Value[:5]
+				logFields["schemaIDInBody"] = schemaIDBeforeSend
+			} else {
+				logFields["bodyStartsWith"] = string(kafkaMsg.Value[:min(20, len(kafkaMsg.Value))])
+			}
+		}
+		
+		logrus.WithFields(logFields).Warn("🔥 writer.WriteMessages: FINAL CHECK before Kafka send")
 	}
 
 	originalErr := writer.WriteMessages(k.vu.Context(), kafkaMessages...)
