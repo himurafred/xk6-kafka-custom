@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/hamba/avro/v2"
-	"github.com/sirupsen/logrus"
 )
 
 // IMPORTANT:
@@ -100,54 +99,34 @@ func toAvroJSON(value any, sch avro.Schema) (any, error) {
 			return nil, fmt.Errorf("null not allowed in union")
 		}
 
-		// Check if value is already wrapped (e.g., {"TypeName": {...}} or {"array": [...]})
+		// Check if value is ALREADY a correctly wrapped union: {"branchName": innerValue}
+		// This is STRICT validation - must match schema exactly
 		if m, ok := value.(map[string]any); ok && len(m) == 1 {
 			for key, val := range m {
-				// Debug: log what we're checking
-				logger := logrus.WithFields(logrus.Fields{
-					"unionKey":      key,
-					"numBranches":   len(s.Types()),
-				})
-				
-				// Try to find a matching branch by name OR by type
+				// Check if key matches any branch name in the schema
 				for _, branch := range s.Types() {
+					if branch.Type() == avro.Null {
+						continue
+					}
 					branchName := unionBranchName(branch)
-					branchType := unionBranchTypeKey(branch)
-					logger.WithFields(logrus.Fields{
-						"branchName": branchName,
-						"branchType": branchType,
-					}).Debug("🔍 Checking union branch")
-					
-					// Check if wrapped by type name (e.g., "orbis.u.medicalrecord....")
 					if key == branchName {
-						logger.Info("✅ Found pre-wrapped union value (by name)")
-						// Already wrapped - validate the content
+						// Found matching branch - validate and preserve structure
 						cv, err := toAvroJSON(val, branch)
 						if err == nil {
+							// Already correctly wrapped - return as-is with validated content
 							return map[string]any{branchName: cv}, nil
 						}
-						logger.WithError(err).Warn("⚠️ Pre-wrapped union validation failed, trying to accept as-is")
-						
-						// If validation failed but the structure looks like it's already Avro JSON, accept it
-						if isAlreadyAvroJSON(val, branch) {
-							logger.Info("✅ Value appears to be already in Avro JSON format, accepting as-is")
-							return map[string]any{branchName: val}, nil
-						}
-					}
-					
-					// Check if wrapped by type key (e.g., "array", "map")
-					// This happens when union branches are wrapped with type keywords instead of type names
-					if key == branchType && branchType != "unknown" {
-						logger.Info("✅ Found pre-wrapped union value (by type)")
-						// Accept as-is - already in correct Avro JSON format
-						return m, nil
+						// Wrapper matches but content invalid - try other branches
 					}
 				}
 			}
 		}
 
-		// Avro JSON: union MUST be wrapped
-		// Java behavior: take first matching branch (no ambiguity error)
+		// Not wrapped - try to wrap with first matching branch
+		// This matches Java Avro behavior: first successful conversion wins
+		// IMPORTANT: Union branches MUST be ordered from most specific to most generic
+		// in the schema to avoid ambiguous matches (e.g., ["int", "string"] not ["string", "int"])
+		// Otherwise "123" as string will match string branch even if int was intended.
 		for _, branch := range s.Types() {
 			if branch.Type() == avro.Null {
 				continue
@@ -208,21 +187,48 @@ func toAvroJSON(value any, sch avro.Schema) (any, error) {
 		return nil, fmt.Errorf("invalid enum value %q", str)
 
 	case *avro.PrimitiveSchema:
-		if s.Type() == avro.Null {
+		// CRITICAL: Validate type strictly to prevent silent data corruption
+		// Java Avro will reject type mismatches - we must do the same
+		switch s.Type() {
+		case avro.Null:
+			if value != nil {
+				return nil, fmt.Errorf("expected null, got %T", value)
+			}
 			return nil, nil
-		}
-		if s.Type() == avro.Bytes {
+		case avro.Boolean:
+			if _, ok := value.(bool); !ok {
+				return nil, fmt.Errorf("expected boolean, got %T", value)
+			}
+			return value, nil
+		case avro.Int, avro.Long:
+			// JSON numbers are unmarshaled as float64
+			if _, ok := value.(float64); !ok {
+				return nil, fmt.Errorf("expected number, got %T", value)
+			}
+			return value, nil
+		case avro.Float, avro.Double:
+			if _, ok := value.(float64); !ok {
+				return nil, fmt.Errorf("expected number, got %T", value)
+			}
+			return value, nil
+		case avro.String:
+			if _, ok := value.(string); !ok {
+				return nil, fmt.Errorf("expected string, got %T", value)
+			}
+			return value, nil
+		case avro.Bytes:
 			str, ok := value.(string)
 			if !ok {
-				return nil, fmt.Errorf("bytes must be base64 string")
+				return nil, fmt.Errorf("expected base64 string for bytes, got %T", value)
 			}
 			// Validate base64 encoding (Java will decode it)
 			if _, err := base64.StdEncoding.DecodeString(str); err != nil {
 				return nil, fmt.Errorf("invalid base64 for bytes: %w", err)
 			}
 			return str, nil
+		default:
+			return nil, fmt.Errorf("unsupported primitive type %v", s.Type())
 		}
-		return value, nil
 
 	default:
 		return nil, fmt.Errorf("unsupported schema %T", sch)
@@ -230,36 +236,19 @@ func toAvroJSON(value any, sch avro.Schema) (any, error) {
 }
 
 // unionBranchName returns the name to use for union branch wrapping.
+// This is the ONLY correct way to wrap unions in Avro JSON for Java compatibility.
+//
+// CRITICAL: This must match EXACTLY what Java Avro expects:
+// - Named types (records, enums, fixed): use FullName (namespace.name)
+// - Primitives: use type name (string, int, long, etc.)
+// - Complex anonymous types (array, map): use type keyword
+//
+// Java reference: org.apache.avro.io.JsonEncoder.writeIndex()
+// Test with: new JsonDecoder(schema, jsonString) to verify compatibility
 func unionBranchName(sch avro.Schema) string {
 	if named, ok := sch.(avro.NamedSchema); ok {
 		return named.FullName()
 	}
-	switch sch.Type() {
-	case avro.String:
-		return "string"
-	case avro.Int:
-		return "int"
-	case avro.Long:
-		return "long"
-	case avro.Float:
-		return "float"
-	case avro.Double:
-		return "double"
-	case avro.Boolean:
-		return "boolean"
-	case avro.Bytes:
-		return "bytes"
-	case avro.Null:
-		return "null"
-	default:
-		return "unknown"
-	}
-}
-
-// unionBranchTypeKey returns the type-based key for union wrapping.
-// This is used when unions are wrapped with type keywords like "array", "map"
-// instead of type names like "MyRecordType".
-func unionBranchTypeKey(sch avro.Schema) string {
 	switch sch.Type() {
 	case avro.Array:
 		return "array"
@@ -283,135 +272,5 @@ func unionBranchTypeKey(sch avro.Schema) string {
 		return "null"
 	default:
 		return "unknown"
-	}
-}
-
-// isAlreadyAvroJSON checks if a value appears to already be in Avro JSON format.
-// This is specifically for union branches that might be pre-formatted.
-// For example, array unions in Avro JSON should be {"array": [...]}, not just [...]
-func isAlreadyAvroJSON(value any, sch avro.Schema) bool {
-	// Resolve references
-	if ref, ok := sch.(*avro.RefSchema); ok {
-		return isAlreadyAvroJSON(value, ref.Schema())
-	}
-
-	switch s := sch.(type) {
-	case *avro.ArraySchema:
-		// In Avro JSON, arrays can be represented as {"array": [...]}
-		// This is the standard format when arrays are inside a union
-		if m, ok := value.(map[string]any); ok {
-			if arr, hasArray := m["array"]; hasArray {
-				// Check if the array itself looks valid
-				if arrSlice, isSlice := arr.([]any); isSlice {
-					// Validate all elements
-					for _, elem := range arrSlice {
-						if !isAlreadyAvroJSON(elem, s.Items()) {
-							return false
-						}
-					}
-					return true
-				}
-			}
-		}
-		// Also accept plain arrays
-		if arr, ok := value.([]any); ok {
-			for _, elem := range arr {
-				if !isAlreadyAvroJSON(elem, s.Items()) {
-					return false
-				}
-			}
-			return true
-		}
-		return false
-
-	case *avro.MapSchema:
-		// Maps in Avro JSON can be {"map": {...}}
-		if m, ok := value.(map[string]any); ok {
-			if mapVal, hasMap := m["map"]; hasMap {
-				if mapObj, isMap := mapVal.(map[string]any); isMap {
-					for _, v := range mapObj {
-						if !isAlreadyAvroJSON(v, s.Values()) {
-							return false
-						}
-					}
-					return true
-				}
-			}
-			// Also accept plain maps (validate all values)
-			for _, v := range m {
-				if !isAlreadyAvroJSON(v, s.Values()) {
-					return false
-				}
-			}
-			return true
-		}
-		return false
-
-	case *avro.UnionSchema:
-		// Union must be wrapped: {"type": value}
-		if m, ok := value.(map[string]any); ok && len(m) == 1 {
-			for key, val := range m {
-				for _, branch := range s.Types() {
-					if key == unionBranchName(branch) {
-						return isAlreadyAvroJSON(val, branch)
-					}
-				}
-			}
-		}
-		return false
-
-	case *avro.RecordSchema:
-		// Records should be objects with expected fields
-		_, ok := value.(map[string]any)
-		if !ok {
-			return false
-		}
-		// Just check that it's a map - detailed validation would be too expensive
-		return true
-
-	case *avro.PrimitiveSchema:
-		// Primitives are straightforward
-		switch s.Type() {
-		case avro.Null:
-			return value == nil
-		case avro.Boolean:
-			_, ok := value.(bool)
-			return ok
-		case avro.Int, avro.Long:
-			// JSON numbers are float64
-			_, ok := value.(float64)
-			return ok
-		case avro.Float, avro.Double:
-			_, ok := value.(float64)
-			return ok
-		case avro.String:
-			_, ok := value.(string)
-			return ok
-		case avro.Bytes:
-			// Bytes should be base64-encoded strings
-			str, ok := value.(string)
-			if !ok {
-				return false
-			}
-			_, err := base64.StdEncoding.DecodeString(str)
-			return err == nil
-		}
-		return false
-
-	case *avro.EnumSchema:
-		str, ok := value.(string)
-		if !ok {
-			return false
-		}
-		// Check if it's a valid enum symbol
-		for _, sym := range s.Symbols() {
-			if sym == str {
-				return true
-			}
-		}
-		return false
-
-	default:
-		return false
 	}
 }

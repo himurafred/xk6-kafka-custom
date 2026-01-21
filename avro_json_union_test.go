@@ -67,7 +67,7 @@ func TestAvroJSON_RealMedicalRecordEntry(t *testing.T) {
 		// Serialize to JSON Avro
 		schemaWrapper := &Schema{Schema: schemaStr, avroSchema: schema}
 		result, xk6Err := serde.SerializeJSONAvro(input, schemaWrapper)
-		
+
 		if xk6Err != nil {
 			t.Logf("Error: %v", xk6Err)
 		}
@@ -113,9 +113,7 @@ func TestAvroJSON_RealMedicalRecordEntry(t *testing.T) {
 		err = json.Unmarshal(result, &output)
 		require.NoError(t, err)
 
-		// Null should be wrapped
-		medRecEntry, ok := output["medicalRecordEntry"].(map[string]any)
-		require.True(t, ok)
-		assert.Nil(t, medRecEntry["null"])
+		// Null should NOT be wrapped in Avro JSON - it stays as null
+		assert.Nil(t, output["medicalRecordEntry"], "null should remain null, NOT be wrapped")
 	})
 }

@@ -92,20 +92,22 @@ func TestAvroJSON_MedicalRecordSample(t *testing.T) {
 
 	serde := &AvroSerde{}
 
-	// Input with some nulls and already-wrapped union values
+	// Input FULLY in Avro JSON format (all unions wrapped correctly)
 	input := map[string]any{
 		"eventId":     float64(2196648751),
 		"eventClass":  "EDIT",
-		"application": nil, // Should stay as null
+		"application": nil, // null stays null
 		"initiator":   "10000",
-		"move":        false, // Should be unwrapped boolean
+		"move": map[string]any{
+			"boolean": false, // Union wrapped correctly
+		},
 		"medicalRecordEntry": map[string]any{
 			"orbis.u.medicalrecord.serdes.avro.notification.MedicalRecordEntry": map[string]any{
 				"caseIdentifier": "100000243",
 				"form":           "OP Bericht",
-				"description":    nil, // Should stay as null
+				"description":    nil, // null stays null
 				"specialties": map[string]any{
-					"array": []any{"KG INT"}, // Already wrapped as {"array": [...]}
+					"array": []any{"KG INT"}, // Union of array correctly wrapped
 				},
 			},
 		},
@@ -125,7 +127,10 @@ func TestAvroJSON_MedicalRecordSample(t *testing.T) {
 
 	// Verify structure
 	require.Nil(t, output["application"], "application should be null")
-	require.Equal(t, false, output["move"], "move should be unwrapped boolean")
+
+	// move should still be wrapped
+	move := output["move"].(map[string]any)
+	require.Equal(t, false, move["boolean"], "move should be wrapped boolean")
 
 	medRecEntry := output["medicalRecordEntry"].(map[string]any)
 	require.Contains(t, medRecEntry, "orbis.u.medicalrecord.serdes.avro.notification.MedicalRecordEntry")
